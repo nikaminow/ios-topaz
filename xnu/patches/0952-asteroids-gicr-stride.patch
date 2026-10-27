@@ -1,0 +1,42 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 710ce5b..3da9221 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -25,6 +25,8 @@ SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
++/* GICv4 (asteroids/SM7635) has 0x40000 per redistributor: ADT redistributor-stride */
++static vm_offset_t gicr_stride = GICR_PE_SIZE;
+ 
+ static uint32_t
+ _gic_read32(vm_offset_t addr)
+@@ -56,7 +58,7 @@ find_gicr_pe_base()
+ 	// We only care about aff1 and aff0
+ 	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+ 
+-	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
++	for (vm_offset_t offset = 0; offset < gicr_size; offset += gicr_stride) {
+ 		vm_offset_t gicr_pe_base = gicr_base + offset;
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+ 		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+@@ -117,6 +119,19 @@ pe_init_fiq()
+ 			sweet_vtimer_intid = intid;
+ 		}
+ 		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
++		void const *stride_prop;
++		unsigned int stride_size;
++		if (SecureDTGetProperty(entry, "redistributor-stride", &stride_prop, &stride_size) == kSuccess) {
++			if (stride_size != sizeof(uint32_t)) {
++				panic("%s: invalid redistributor-stride size %u", __func__, stride_size);
++			}
++			uint32_t stride = *(const uint32_t *)stride_prop;
++			if (stride != 0x20000 && stride != 0x40000) {
++				panic("%s: unsupported redistributor stride 0x%x", __func__, stride);
++			}
++			gicr_stride = stride;
++		}
++		kprintf("SWEET GIC: redistributor stride 0x%lx\n", (unsigned long)gicr_stride);
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();

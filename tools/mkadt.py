@@ -43,6 +43,24 @@ QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 
+# --asteroids: Nothing Phone (3a) (SM7635 "milos", 8 GB). Values from the ABL
+# DTB as read by the asteroids probe and mainline milos.dtsi:
+#   memory: 13 ranges, a clean 4 GiB bank at 0x9_00000000 (every fixed
+#   reserved-memory node, Gunyah included, is below 4 GiB)
+#   GIC-600 (GICv4): GICD 0x17100000, GICR 0x17180000 + 0x200000, stride 0x40000
+#   arch timer: virtual = PPI 11 (INTID 27)
+#   splash_region 0xe3940000 + 0x2b00000, 1080x2392 a8r8g8b8
+#   CPUs: MPIDR Aff1 = core (0x000-0x700), all with the 16K granule; ABL
+#   starts on 0x000. No UFS, display, Wi-Fi or other topaz drivers here.
+AST_PHYS_BASE, AST_MEM_SIZE = 0x900000000, 0x100000000
+AST_GICD, AST_GICD_SIZE = 0x17100000, 0x10000
+AST_GICR, AST_GICR_SIZE = 0x17180000, 0x200000
+AST_GICR_STRIDE = 0x40000
+AST_VTIMER_INTID = 27
+AST_FB, AST_FB_SIZE = 0xe3940000, 0x2b00000
+AST_FB_W, AST_FB_H = 1080, 2392
+AST_ECID = 0x4153545200000001  # 'ASTR' + 1, synthetic
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -76,11 +94,20 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, asteroids=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    asteroids=True: Nothing Phone (3a), kernel, GIC and framebuffer console only."""
+    phys_base, mem_size = ((AST_PHYS_BASE, AST_MEM_SIZE) if asteroids else
+                           (MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    gicd_size, gicr_size = GICD_SIZE, GICR_SIZE
+    vtimer = QEMU_VTIMER_INTID if qemu else VTIMER_INTID
+    fb, fb_size, fb_w, fb_h = FB, FB_SIZE, FB_W, FB_H
+    if asteroids:
+        gicd, gicd_size, gicr, gicr_size = AST_GICD, AST_GICD_SIZE, AST_GICR, AST_GICR_SIZE
+        vtimer = AST_VTIMER_INTID
+        fb, fb_size, fb_w, fb_h = AST_FB, AST_FB_SIZE, AST_FB_W, AST_FB_H
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -110,7 +137,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', AST_ECID if asteroids else SWEET_ECID)),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -133,13 +160,16 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # asteroids: all eight cores (4x A520 then 4x A720, MPIDR Aff1 = core) as one
+    # homogeneous cluster in DT order; ABL's boot core 0x000 is cpu0.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
+    for core in range(1 if qemu else 8 if asteroids else 4):
+        mpidr = core if qemu else core << 8 if asteroids else 0x100 | core
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('reg', u32(mpidr)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -162,9 +192,12 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
-    ])
+        ('virtual-timer-intid', u32(vtimer)),
+        ('reg', u64(gicd - SOC_BASE, gicd_size, gicr - SOC_BASE, gicr_size)),
+    ] + ([('redistributor-stride', u32(AST_GICR_STRIDE))] if asteroids else []))
+    # Hardware nodes that start topaz drivers (Wi-Fi, MDP display) are left out
+    # on asteroids: their registers are other hardware there.
+    no_hw = ['wlan', 'disp0'] if asteroids else []
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -198,13 +231,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('canvas-width', u32(1080 if native else 1125)),
             ('canvas-height', u32(2400 if native else 2436)),
         ])])
+    arm_io.children = [c for c in arm_io.children if c.name not in no_hw]
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(fb, fb_size)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_w * 4)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -241,21 +275,27 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
+    # asteroids: no 'xiaomi,topaz' / 'qcom,khaje', which gate topaz-only register
+    # access (patch 0954: SweetBattery's cpufreq and I2C1); 'xiaomi,sweet' stays
+    # for SweetPlatformExpert.
+    board = (cstr('nothing,asteroids') + cstr('xiaomi,sweet') + cstr('qcom,milos') if asteroids else
+             cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje'))
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + board + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or asteroids else [ufs]))
 
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 asteroids='--asteroids' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

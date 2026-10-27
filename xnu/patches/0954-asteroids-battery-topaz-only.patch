@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9da8fae..4c2b117 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -429,16 +430,53 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++/*
++ * The cpufreq, I2C1 gauge and charger registers are topaz (SM6225) MMIO. Any
++ * other board (asteroids, whose ADT root lacks "xiaomi,topaz") gets the static
++ * source and no register access.
++ */
++static bool
++sweet_board_is_topaz(void)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	static const char want[] = "xiaomi,topaz";
++	const char *s = (const char *)prop;
++	/* compatible is a list of NUL-terminated strings */
++	for (unsigned int off = 0; off < size;) {
++		unsigned int len = 0;
++		while (off + len < size && s[off + len] != '\0') {
++			len++;
++		}
++		if (len == sizeof(want) - 1 && memcmp(s + off, want, len) == 0) {
++			return true;
++		}
++		off += len + 1;
++	}
++	return false;
++}
++
+ bool
+ SweetBattery::start(IOService *provider)
+ {
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	(void)sweet_cpufreq_max();
++	bool topaz = sweet_board_is_topaz();
++	if (topaz) {
++		(void)sweet_cpufreq_max();
++	} else {
++		IOLog("SWEET BATTERY: not topaz: static source, no cpufreq/I2C\n");
++	}
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
++	fReal = topaz && real == 1 && sweet_i2c1_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
