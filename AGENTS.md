@@ -1,16 +1,34 @@
-# Working on ios-sweet
+# Working on ios-topaz → Nothing Phone (3a) (`asteroids` branch)
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
-  after each milestone and before stopping. Record commits, CI run IDs, exact
-  build/boot results and unfinished work. Distinguish observations from guesses.
-- Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.
-  Local single-file cross-compiles are useful before spending a CI run.
-- Device bring-up uses temporary `fastboot boot` images. Preserve the Android
-  installation and partition backups. The user approved (2026-10-15) using
-  internal UFS for iOS and said Android may be deleted: the iOS root goes
-  into the existing `userdata` partition (no GPT changes). Keep bootloaders,
-  recovery, modem, persist and the backups intact, and confirm each
-  destructive step with the user before running it.
-- Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+You are probably an AI coding agent helping with this port. Read this first.
+
+## Hard rules (phone safety)
+
+- **Never write to the phone's storage.** No `fastboot flash`, no `fastboot erase`,
+  no writes to `userdata` or any partition, no `rd=ufsroot0`, no `sweet-ufs` ADT node.
+  Everything boots from RAM with `fastboot boot`; a reboot must always bring Android back.
+  (The topaz rule "userdata may be erased" does NOT apply to this branch.)
+- **No fixed SM6225 (topaz) addresses on this phone.** Any driver that maps a hardcoded
+  physical address must be gated so it cannot run on `asteroids` (see patches 0953, 0954
+  and the ADT: no `wlan`, `disp0`, `sweet-ufs` nodes). New MMIO must come from the
+  phone's own device tree and be explained in the patch.
+- Keep Apple artifacts (IPSW, device trees, root images), device dumps and serial
+  numbers out of git.
+
+## Where things are
+
+| Path | What |
+| --- | --- |
+| `README.md` (top section) | Phone facts, status, patch list |
+| `tools/mkadt.py --asteroids` | Apple Device Tree for the phone |
+| `shim-asteroids/` | Boot shim: reads the ABL DTB, prepares the GIC, loads XNU (LLVM: `clang --target=aarch64-none-elf`) |
+| `xnu/patches/0951-0954` | asteroids XNU patches; the rest are topaz/sweet |
+| `.github/workflows/xnu.yml` | Kernel build on macOS runners: `gh workflow run xnu.yml --ref asteroids` |
+
+## How to work
+
+- Patches apply in filename order on xnu-8796.141.3 (macOS 13.5). To write a new one,
+  apply the series to that tag, change the tree, and `git diff` into `xnu/patches/NNNN-asteroids-*.patch`
+  with LF line endings. A patch that does not apply is silently skipped by CI: check the log.
+- Prefer one small patch per change, with a comment that says why.
+- Mark what you observed on the phone versus what you guess. Open issues are the task list.
