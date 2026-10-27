@@ -44,19 +44,24 @@ def main():
     t0 = time.time()
     while True:
         try:
-            pkt = bytes(dev.read(0x81, REQ.size + MAX, timeout=0))
+            pkt = bytes(dev.read(0x81, REQ.size + MAX + 512, timeout=0))
         except usb.core.USBError as e:
-            print('USB:', e)
+            print(f'USB read of the next request failed: {e} (after {reads >> 10} KiB read, {writes >> 10} KiB written)')
             return
         magic, op, seq, length, offset, _ = REQ.unpack_from(pkt)
         if magic != REQ_MAGIC:
             print(f'bad request magic {magic:#x}')
             continue
         status = 0
+        print(f'  req seq {seq} op {op} offset {offset:#x} length {length} (got {len(pkt)} bytes)') if seq < 20 else None
         if op == READ:
             f.seek(offset)
             data = f.read(length).ljust(length, b'\0')
-            dev.write(0x01, data, timeout=20000)
+            try:
+                dev.write(0x01, data, timeout=20000)
+            except usb.core.USBError as e:
+                print(f'USB write of {length} bytes (seq {seq}) failed: {e}')
+                return
             reads += length
         elif op == WRITE:
             f.seek(offset)

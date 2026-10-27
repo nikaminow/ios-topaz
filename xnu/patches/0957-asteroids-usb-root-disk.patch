@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 6baf3a8..a42a94d 100644
+index 6baf3a8..4a2432a 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -33,6 +33,13 @@
@@ -93,7 +93,7 @@ index 6baf3a8..a42a94d 100644
  		ud_if_create();
  	}
  
-@@ -1017,4 +1047,335 @@ sweet_usb_root_receive(uint64_t pa, uint64_t size)
+@@ -1017,4 +1047,347 @@ sweet_usb_root_receive(uint64_t pa, uint64_t size)
  	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
  	return 0;
  }
@@ -133,6 +133,7 @@ index 6baf3a8..a42a94d 100644
 +static LCK_MTX_DECLARE(udk_lock, &udk_grp);
 +static uint32_t udk_seq;
 +static uint64_t udk_size;
++static uint32_t udk_secsize = UDK_BLOCK;  /* HFS sets 512 first (DKIOCSETBLOCKSIZE) */
 +static dev_t udk_bdev;
 +
 +/* Wait for *flag (set by the event thread), up to UDK_TIMEOUT_MS. */
@@ -252,7 +253,7 @@ index 6baf3a8..a42a94d 100644
 +{
 +	int error = 0;
 +	caddr_t vaddr = NULL;
-+	uint64_t off = (uint64_t)buf_blkno(bp) * UDK_BLOCK;
++	uint64_t off = (uint64_t)buf_blkno(bp) * udk_secsize;
 +	uint32_t count = buf_count(bp);
 +	bool rd = buf_flags(bp) & B_READ;
 +
@@ -302,13 +303,19 @@ index 6baf3a8..a42a94d 100644
 +
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
++		*f = udk_secsize;
++		return 0;
 +	case DKIOCGETPHYSICALBLOCKSIZE:
 +		*f = UDK_BLOCK;
 +		return 0;
 +	case DKIOCSETBLOCKSIZE:
-+		return *f == UDK_BLOCK ? 0 : EINVAL;
++		if (*f < DEV_BSIZE || *f > UDK_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		udk_secsize = *f;
++		return 0;
 +	case DKIOCGETBLOCKCOUNT:
-+		*o = udk_size / UDK_BLOCK;
++		*o = udk_size / udk_secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
 +		*f = 1;
@@ -322,7 +329,7 @@ index 6baf3a8..a42a94d 100644
 +	}
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = UDK_MAX / UDK_BLOCK;
++		*o = UDK_MAX / udk_secsize;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -342,19 +349,19 @@ index 6baf3a8..a42a94d 100644
 +static int
 +udk_psize(__unused dev_t dev)
 +{
-+	return udk_size ? (int)MIN(udk_size / UDK_BLOCK, INT_MAX) : -1;
++	return udk_size ? (int)MIN(udk_size / udk_secsize, INT_MAX) : -1;
 +}
 +
 +static int
 +udk_read(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return physio(udk_strategy, NULL, dev, B_READ, minphys, uio, UDK_BLOCK);
++	return physio(udk_strategy, NULL, dev, B_READ, minphys, uio, (int)udk_secsize);
 +}
 +
 +static int
 +udk_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return physio(udk_strategy, NULL, dev, B_WRITE, minphys, uio, UDK_BLOCK);
++	return physio(udk_strategy, NULL, dev, B_WRITE, minphys, uio, (int)udk_secsize);
 +}
 +
 +static const struct bdevsw udk_bdevsw = {
@@ -390,6 +397,11 @@ index 6baf3a8..a42a94d 100644
 +int
 +sweet_usbdisk_rootdev(dev_t *dev)
 +{
++	/* IOFindBSDRoot asks again after a failed mount: keep the running gadget and disk */
++	if (udk_bdev) {
++		*dev = udk_bdev;
++		return 0;
++	}
 +	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
 +	if (dwc == 0 || (usb_rd(dwc, 0xc120) >> 16) != 0x5533) {
 +		printf("SWEET USB DISK: no DWC3 at 0x%x\n", DWC3_PA);
