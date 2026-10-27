@@ -54,7 +54,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 #   starts on 0x000. No UFS, display, Wi-Fi or other topaz drivers here.
 # 0x8_bf800000 + 0x40800000 and 0x9_00000000 + 4 GiB are adjacent banks: 5 GiB
 # from the first 32 MB boundary
-AST_PHYS_BASE, AST_MEM_SIZE = 0x8c0000000, 0x140000000
+# (5 GiB from 0x8_c0000000 hung dyld's first vm_allocate in the kernel; the
+# 4 GiB bank at 0x9_00000000 is the layout that booted, so it stays the default)
+AST_PHYS_BASE, AST_MEM_SIZE = 0x900000000, 0x100000000
 AST_GICD, AST_GICD_SIZE = 0x17100000, 0x10000
 AST_GICR, AST_GICR_SIZE = 0x17180000, 0x200000
 AST_GICR_STRIDE = 0x40000
