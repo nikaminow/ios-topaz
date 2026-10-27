@@ -40,15 +40,19 @@ def main():
     dev.set_configuration(1)
     usb.util.claim_interface(dev, 0)
     print('phone connected; serving blocks (Ctrl+C stops iOS\'s disk)')
-    reads = writes = 0
+    reads = writes = last_seq = 0
     t0 = time.time()
     while True:
         try:
-            pkt = bytes(dev.read(0x81, REQ.size + MAX + 512, timeout=0))
+            pkt = bytes(dev.read(0x81, REQ.size + MAX + 512, timeout=5000))
+        except usb.core.USBTimeoutError:
+            print(f'  idle 5 s: the phone sends no requests (last seq {last_seq}, read {reads >> 20} MiB)')
+            continue
         except usb.core.USBError as e:
             print(f'USB read of the next request failed: {e} (after {reads >> 10} KiB read, {writes >> 10} KiB written)')
             return
         magic, op, seq, length, offset, _ = REQ.unpack_from(pkt)
+        last_seq = seq
         if magic != REQ_MAGIC:
             print(f'bad request magic {magic:#x}')
             continue
