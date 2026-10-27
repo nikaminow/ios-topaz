@@ -52,7 +52,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 #   splash_region 0xe3940000 + 0x2b00000, 1080x2392 a8r8g8b8
 #   CPUs: MPIDR Aff1 = core (0x000-0x700), all with the 16K granule; ABL
 #   starts on 0x000. No UFS, display, Wi-Fi or other topaz drivers here.
-AST_PHYS_BASE, AST_MEM_SIZE = 0x900000000, 0x100000000
+# 0x8_bf800000 + 0x40800000 and 0x9_00000000 + 4 GiB are adjacent banks: 5 GiB
+# from the first 32 MB boundary
+AST_PHYS_BASE, AST_MEM_SIZE = 0x8c0000000, 0x140000000
 AST_GICD, AST_GICD_SIZE = 0x17100000, 0x10000
 AST_GICR, AST_GICR_SIZE = 0x17180000, 0x200000
 AST_GICR_STRIDE = 0x40000

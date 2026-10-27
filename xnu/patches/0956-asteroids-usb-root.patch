@@ -1,0 +1,214 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ad1acf5..6baf3a8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
++int sweet_usb_root_receive(uint64_t pa, uint64_t size);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -233,8 +234,15 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* asteroids root mode (sweet_usb_root_receive): bulk OUT lands in the RAM disk */
++	uint64_t    root_pa, root_size, root_off;
++	uint32_t    root_chunk;
++	volatile bool root_done;
+ } ud;
+ 
++/* bulk OUT chunk: below the TRB's 24-bit length limit, a multiple of 512 */
++#define UD_ROOT_CHUNK   (16u * 1024 * 1024 - 512)
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -350,6 +358,21 @@ static const uint8_t ud_cfg_desc[80] = {
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
+ };
++/*
++ * Root mode: one vendor interface with bulk IN/OUT (PID 0x0002), which a PC
++ * drives with WinUSB/libusb (tools/usb-root-send.py). No CDC: Windows has no
++ * ECM class driver.
++ */
++static const uint8_t ud_root_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_root_cfg_desc[32] = {
++	9, 2, 32, 0, 1, 1, 0, 0x80, 250,                /* config: 1 interface, 500 mA */
++	9, 4, 0, 0, 2, 0xff, 0x00, 0x00, 0,             /* interface 0: vendor, 2 endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+ 
+ static uint32_t
+@@ -432,8 +455,20 @@ ud_setup(void)
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1:
++			if (ud.root_pa) {
++				memcpy(data, ud_root_dev_desc, sizeof(ud_root_dev_desc)); n = sizeof(ud_root_dev_desc);
++			} else {
++				memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc);
++			}
++			break;
++		case 2:
++			if (ud.root_pa) {
++				memcpy(data, ud_root_cfg_desc, sizeof(ud_root_cfg_desc)); n = sizeof(ud_root_cfg_desc);
++			} else {
++				memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc);
++			}
++			break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -484,15 +519,63 @@ ud_setup(void)
+ 
+ /* ---- network interface (ue0) ---- */
+ 
++/* Root mode: the next bulk OUT chunk, DMA straight into the RAM disk. */
++static void
++ud_root_arm(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	uint64_t left = ud.root_size - ud.root_off;
++	uint64_t pa = ud.root_pa + ud.root_off;
++
++	ud.root_chunk = left < UD_ROOT_CHUNK ? (uint32_t)left : UD_ROOT_CHUNK;
++	/* no dirty lines may be written back over what the controller writes */
++	flush_dcache64((addr64_t)pa, ud.root_chunk, TRUE);
++	t[0] = (uint32_t)pa;
++	t[1] = (uint32_t)(pa >> 32);
++	t[2] = ud.root_chunk;
++	t[3] = TRBCTL_NORMAL | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(UD_TRB_RX, 16);
++	uint64_t tpa = ud.dma_pa + UD_TRB_RX;
++	ud_epcmd(EP_RX, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++static void
++ud_root_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len = ud.root_chunk - (t[2] & 0xffffff);
++	flush_dcache64((addr64_t)(ud.root_pa + ud.root_off), len, TRUE);  /* drop stale lines */
++	uint64_t before = ud.root_off;
++	ud.root_off += len;
++	if ((ud.root_off >> 26) != (before >> 26)) {    /* every 64 MiB */
++		printf("SWEET USB ROOT: %llu / %llu MiB\n", ud.root_off >> 20, ud.root_size >> 20);
++	}
++	/* a short packet or the full size ends the image */
++	if (ud.root_off >= ud.root_size || len < ud.root_chunk) {
++		ud.root_done = true;
++		return;
++	}
++	ud_root_arm();
++}
++
+ static void
+ ud_rx_arm(void)
+ {
++	if (ud.root_pa) {
++		ud_root_arm();
++		return;
++	}
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
+ static void
+ ud_rx_done(void)
+ {
++	if (ud.root_pa) {
++		ud_root_done();
++		return;
++	}
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+@@ -828,7 +911,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
++	if (!ud.root_pa) {
++		ud_if_create();
++	}
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+@@ -892,4 +977,44 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * asteroids: receive the root image over USB into the RAM disk at [pa, pa +
++ * size) before IOFindBSDRoot turns it into md0 (boot-arg usbroot=1; the PC
++ * runs tools/usb-root-send.py). ABL leaves the DWC3 at 0x0a600000 clocked,
++ * in device mode and halted with the PHY up (asteroids probe v3: GSNPSID
++ * 0x5533330a), so only the device controller is restarted, as on sweet; no
++ * GCC or PHY register is touched. Blocks until the image is in.
++ */
++int
++sweet_usb_root_receive(uint64_t pa, uint64_t size)
++{
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		printf("SWEET USB ROOT: DWC3 map failed\n");
++		return -1;
++	}
++	uint32_t id = usb_rd(dwc, 0xc120);
++	if ((id >> 16) != 0x5533) {
++		printf("SWEET USB ROOT: no DWC3 at 0x%x (GSNPSID 0x%08x)\n", DWC3_PA, id);
++		return -1;
++	}
++	ud.root_pa = pa;
++	ud.root_size = size;
++	ud.root_off = 0;
++	ud.root_done = false;
++	printf("SWEET USB ROOT: waiting for %llu MiB at 0x%llx: run tools/usb-root-send.py on the PC\n",
++	    size >> 20, pa);
++	sweet_usb_gadget_start(dwc);
++	uint64_t deadline;
++	while (!ud.root_done) {
++		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&ud.root_done, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	printf("SWEET USB ROOT: %llu MiB received\n", ud.root_off >> 20);
++	/* detach from the host; the event thread keeps polling an idle controller */
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	return 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 98c235c..fa3ff4c 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -760,6 +760,16 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 					panic("ramdisk params");
+ 				}
+ #endif /* __LP64__ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				/* asteroids: the RAM disk is empty in the payload and filled over USB */
++				int usbroot = 0;
++				if (PE_parse_boot_argn("usbroot", &usbroot, sizeof(usbroot)) && usbroot == 1) {
++					extern int sweet_usb_root_receive(uint64_t pa, uint64_t size);
++					if (sweet_usb_root_receive(ramdParms[0], ramdParms[1]) != 0) {
++						panic("usbroot=1: USB root receive failed");
++					}
++				}
++#endif
+ 				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
+ 			}
+ 			regEntry->release();                                                            /* Toss the entry */

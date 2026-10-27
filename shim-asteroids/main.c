@@ -90,12 +90,21 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 		__asm__ volatile("wfe");
 }
 
+/* Is [pa, pa + size) covered by /memory banks, adjacent ones joined? */
 int ram_ok(uint64_t pa, uint64_t size)
 {
-	for (int i = 0; i < board.nmem; i++)
-		if (pa >= board.mem_pa[i] && pa + size <= board.mem_pa[i] + board.mem_size[i])
-			return 1;
-	return 0;
+	uint64_t at = pa, end = pa + size;
+	for (int pass = 0; pass < board.nmem && at < end; pass++) {
+		int moved = 0;
+		for (int i = 0; i < board.nmem; i++)
+			if (at >= board.mem_pa[i] && at < board.mem_pa[i] + board.mem_size[i]) {
+				at = board.mem_pa[i] + board.mem_size[i];
+				moved = 1;
+			}
+		if (!moved)
+			return 0;
+	}
+	return at >= end;
 }
 
 /* ---- exceptions ---- */

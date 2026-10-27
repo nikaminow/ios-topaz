@@ -140,7 +140,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, ramdisk_size=0):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -167,6 +167,15 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    elif ramdisk_size:
+        # asteroids usbroot=1: reserve the RAM disk behind the kernel but send no
+        # bytes for it; the kernel fills it over USB (patch 0956).
+        rd_size = (ramdisk_size + PAGE - 1) & ~(PAGE - 1)
+        rd_va = kernel_end
+        kernel_end = rd_va + rd_size
+        rd_pa = rd_va - virt_base + PHYS_BASE
+        adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
+        ramdisk = (hex(rd_pa), hex(rd_size), 'reserved, filled over USB')
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -198,8 +207,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--ramdisk-size', type=lambda s: int(s, 0), default=0,
+                    help='reserve an empty md0 of this many bytes, filled over USB (usbroot=1 rd=md0)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.ramdisk_size)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
