@@ -162,9 +162,12 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, aste
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     # asteroids: all eight cores (4x A520 then 4x A720, MPIDR Aff1 = core) as one
     # homogeneous cluster in DT order; ABL's boot core 0x000 is cpu0.
+    # Core 0x500 does not report back after PSCI CPU_ON (probe v2, issue #2): left out.
+    cores = [0, 1, 2, 3, 4, 6, 7] if asteroids else range(1 if qemu else 4)
     cpu_nodes = []
-    for core in range(1 if qemu else 8 if asteroids else 4):
+    for logical, core in enumerate(cores):
         mpidr = core if qemu else core << 8 if asteroids else 0x100 | core
+        core = logical  # cpu-id / cluster-core-id / node name follow DT order
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
@@ -198,7 +201,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, aste
     # Hardware nodes that start topaz drivers (Wi-Fi, MDP display) are left out
     # on asteroids: their registers are other hardware there.
     # disp0 stays: patch 0955 keeps AppleCLCD to CPU copies off topaz (no MDP/DSI)
-    no_hw = ['wlan'] if asteroids else []
+    # --nodisp: for kernels without 0955, whose AppleCLCD maps topaz MDP/DSI registers
+    no_hw = (['wlan'] + (['disp0'] if '--nodisp' in sys.argv else [])) if asteroids else []
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),

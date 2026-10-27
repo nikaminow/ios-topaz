@@ -16,7 +16,10 @@
 | XNU patches 0951â€“0954 (below) | done, building on CI |
 | First kernel boot: platform expert, CPU0 + GIC (SGI OK), BSD, AMFI, Sandbox, HFS, then `Waiting on ... IOMedia Apple_HFS` | **done** |
 | Root file system in RAM (`rd=md0`, issue #5) | next |
-| Display, touch, Wi-Fi, more CPUs | later |
+| SMP: 7 of 8 cores (`cpus=7`; core `0x500` left out, issue #2) | **done**: `7/7 CPUs initialized, SGI1 verified` |
+| Display by CPU copy (0955) | built, to test |
+| Touch: FocalTech on spi0, IRQ GPIO 19 (issue #4) | researched |
+| Wi-Fi | later |
 
 **Why this phone fits well:** all eight cores (4Ã— Cortex-A520 + 4Ã— Cortex-A720) have the
 16K translation granule and LSE atomics, so the topaz Silverâ†’Gold hand-off and the userland
