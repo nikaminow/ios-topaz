@@ -31,6 +31,7 @@ def main():
     path = sys.argv[1]
     size = os.path.getsize(path)
     f = open(path, 'r+b')
+    log = open(path + '.requests.log', 'w')
     print(f'{path}: {size >> 20} MiB; waiting for the phone ({VID:04x}:{PID:04x})...')
     dev = None
     while dev is None:
@@ -58,6 +59,9 @@ def main():
             continue
         status = 0
         print(f'  req seq {seq} op {op} offset {offset:#x} length {length} (got {len(pkt)} bytes)') if seq < 20 else None
+        # every request, for matching against file extents (tools/find-extents.py)
+        log.write(f'{seq} {op} {offset:#x} {length}\n')
+        log.flush()
         if op == READ:
             f.seek(offset)
             data = f.read(length).ljust(length, b'\0')

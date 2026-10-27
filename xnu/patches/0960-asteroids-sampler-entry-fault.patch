@@ -1,0 +1,17 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1031,5 +1031,13 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			tn++;
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
++		/*
++		 * launchd shows state 0x4 (TH_RUN) with a user pc in a dyld page that
++		 * was never read from disk: print how it last entered the kernel. An
++		 * abort ESR with FAR in that page means a page fault that never ends.
++		 */
++		printf("SMP %s k%d entry pc 0x%llx esr 0x%x far 0x%llx\n", name, tn,
++		    (uint64_t)get_saved_state_pc(ss), (unsigned)saved_state64(ss)->esr,
++		    (uint64_t)saved_state64(ss)->far);
