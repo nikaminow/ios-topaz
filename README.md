@@ -1,3 +1,55 @@
+# ios-topaz → Nothing Phone (3a) (`asteroids` branch)
+
+> **This branch ports ios-topaz to the Nothing Phone (3a)** (A059, codename `asteroids`,
+> Qualcomm SM7635 "milos" / Snapdragon 7s Gen 3).
+> **Status: experimental, the kernel has not booted on the phone yet.**
+> Everything boots from RAM with `fastboot boot`: nothing is flashed and `userdata` is never
+> touched. A normal reboot brings Android back.
+
+## Nothing Phone (3a): what is done
+
+| Step | State |
+| --- | --- |
+| Hardware survey from a read-only RAM-booted probe | done: CPUs, memory map, GIC, PSCI, framebuffer |
+| Apple Device Tree for the phone (`tools/mkadt.py --asteroids`) | done |
+| Boot shim for the phone (`shim-asteroids/`) | done, builds with LLVM on Windows |
+| XNU patches 0951–0954 (below) | done, building on CI |
+| First kernel boot to the "no root device" panic | next |
+| Root file system in RAM (`rd=md0`), display, touch, Wi-Fi | later |
+
+**Why this phone fits well:** all eight cores (4× Cortex-A520 + 4× Cortex-A720) have the
+16K translation granule and LSE atomics, so the topaz Silver→Gold hand-off and the userland
+atomics emulation are not needed. The CPU numbering (MPIDR Aff1 = core, `0x000`–`0x700`) is
+the same as the original ios-sweet target.
+
+**Hardware facts (from the ABL device tree):**
+
+- RAM: 13 banks, 7.6 GiB; the kernel gets the clean 4 GiB bank at `0x9_00000000` (every
+  firmware carve-out, Gunyah included, is below 4 GiB).
+- GIC-600 (GICv4): GICD `0x17100000`, GICR `0x17180000`, redistributor stride `0x40000`.
+- Arch timer: virtual = PPI 11 (INTID 27), 19.2 MHz. PSCI 1.1 over SMC. Linux runs at EL1 under Gunyah.
+- Framebuffer: ABL `splash_region` `0xe3940000`, 1080×2392, a8r8g8b8.
+- UFS host `0x1d84000` (not used: no storage access at all on this branch).
+
+**New XNU patches:**
+
+| # | What |
+| --- | --- |
+| 0951 | CPU topology accepts the DynamIQ layout (`0x000`–`0x700`, boot core `0`) next to topaz's |
+| 0952 | GIC redistributor stride from the ADT (`redistributor-stride`), for GICv4's `0x40000` |
+| 0953 | The fixed-address early console only runs when the topaz shim booted the kernel; on this phone that RAM is the Wi-Fi firmware carve-out |
+| 0954 | SweetBattery's cpufreq and I2C register access only on a `xiaomi,topaz` ADT |
+
+**Safety:** the topaz drivers that write to fixed SM6225 addresses (UFS, display, modem,
+Wi-Fi, audio, GPU, touch, keys, battery) are kept off by leaving their ADT nodes out and by
+patches 0953/0954. The shim writes only the GIC that the device tree names, and refuses to
+load the kernel outside a `/memory` bank.
+
+Help with testing on other Nothing Phone (3a) units, or with the SM7635 display and touch,
+is welcome: open an issue.
+
+---
+
 # ios-topaz
 
 **Apple's iOS 16 running on a Redmi Note 12 4G.**
