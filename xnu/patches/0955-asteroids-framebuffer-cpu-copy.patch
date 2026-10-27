@@ -1,0 +1,114 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cd0bec7..26ab7cc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -107,6 +107,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+@@ -304,6 +305,38 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * MDP (VIG0, CTL0, INTF1), DSI, modem, audio and Adreno are SM6225 (topaz)
++ * registers. On any other board (asteroids: no "xiaomi,topaz" in the ADT root)
++ * they stay unmapped (NULL): frames reach the panel by CPU copy into the
++ * framebuffer ABL left scanning out.
++ */
++static bool
++sweet_fb_board_is_topaz(void)
++{
++	static const char want[] = "xiaomi,topaz";
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *s = (const char *)prop;
++	for (unsigned int off = 0; off < size;) {
++		unsigned int len = 0;
++		while (off + len < size && s[off + len] != '\0') {
++			len++;
++		}
++		if (len == sizeof(want) - 1 && memcmp(s + off, want, len) == 0) {
++			return true;
++		}
++		off += len + 1;
++	}
++	return false;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -312,8 +345,13 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+-	topaz_modem_init();
+-	topaz_audio_init();
++	bool topaz = sweet_fb_board_is_topaz();
++	if (topaz) {
++		topaz_modem_init();
++		topaz_audio_init();
++	} else {
++		IOLog("SWEET FB: not topaz: CPU copy only, no MDP/DSI/modem/audio/GPU\n");
++	}
+ 	sweet_amfi_service_init();
+ 	sweet_busy_init();
+ 	PE_current_console(&video);
+@@ -352,11 +390,13 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+-	topaz_adreno_init();
+-	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	if (topaz) {
++		fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
++		fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++		topaz_adreno_init();
++		setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
++		fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	}
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -399,7 +439,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	OSSafeReleaseNULL(accel);
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	fIntf1 = topaz ? (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000) : NULL;
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+@@ -903,7 +943,7 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+-		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
++		for (int t = 0; fCtl0 != NULL && t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
+ 			IODelay(100);                           /* until the MDP has latched it */
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
+@@ -943,6 +983,9 @@ AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
++	if (fVig0 == NULL || fCtl0 == NULL) {
++		return;         /* not topaz: no MDP, the CPU copy path only */
++	}
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");

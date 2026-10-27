@@ -40,6 +40,7 @@ the same as the original ios-sweet target.
 | 0952 | GIC redistributor stride from the ADT (`redistributor-stride`), for GICv4's `0x40000` |
 | 0953 | The fixed-address early console only runs when the topaz shim booted the kernel; on this phone that RAM is the Wi-Fi firmware carve-out |
 | 0954 | SweetBattery's cpufreq and I2C register access only on a `xiaomi,topaz` ADT |
+| 0955 | AppleCLCD off topaz: no MDP/DSI/INTF1 registers, no modem/audio/GPU start; frames reach the panel by CPU copy into the ABL framebuffer |
 
 **Safety:** the topaz drivers that write to fixed SM6225 addresses (UFS, display, modem,
 Wi-Fi, audio, GPU, touch, keys, battery) are kept off by leaving their ADT nodes out and by

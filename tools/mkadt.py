@@ -197,7 +197,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, aste
     ] + ([('redistributor-stride', u32(AST_GICR_STRIDE))] if asteroids else []))
     # Hardware nodes that start topaz drivers (Wi-Fi, MDP display) are left out
     # on asteroids: their registers are other hardware there.
-    no_hw = ['wlan', 'disp0'] if asteroids else []
+    # disp0 stays: patch 0955 keeps AppleCLCD to CPU copies off topaz (no MDP/DSI)
+    no_hw = ['wlan'] if asteroids else []
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
