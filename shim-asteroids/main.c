@@ -212,6 +212,8 @@ void shim_main(uint64_t dtb)
 	}
 	if (!board.gicd) {
 		con_str("STOP", "no arm,gic-v3 in the DTB");
+		con_str("IC0", board.ic_compat[0] ? board.ic_compat[0] : "-");
+		con_str("IC1", board.ic_compat[1] ? board.ic_compat[1] : "-");
 		reset(60);
 	}
 	/* The ABL DTB may omit redistributor-stride: GICv4 frames are 0x40000. */

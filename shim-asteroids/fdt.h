@@ -12,6 +12,8 @@ struct board {
 	int nmem;
 	uint64_t gicd, gicr, gicr_size, gicr_stride;
 	int psci_hvc;
+	/* diagnostics: first two interrupt-controller@ compatibles (point into the DTB) */
+	const char *ic_compat[2];
 	int ncpus;
 };
 

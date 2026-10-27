@@ -124,11 +124,14 @@ const char *fdt_board(uintptr_t fdt, struct board *b)
 	uintptr_t end = fdt + be32(fdt + 4);
 	const char *stack[16];
 	int depth = 0;
-	/* the GIC node's reg and compatible may come in either order */
-	int node_is_gic = 0;
-	uint64_t node_reg[4] = { 0 };
-	int node_nreg = 0;
-	uint64_t node_stride = 0;
+	/*
+	 * The GIC node's reg and compatible may come in either order, and it has
+	 * child nodes (msi-controller@): keep its state per depth.
+	 */
+	int node_is_gic[16] = { 0 };
+	uint64_t node_reg[16][4];
+	int node_nreg[16] = { 0 };
+	uint64_t node_stride[16] = { 0 };
 
 	for (int i = 0; i < 16; i++)
 		stack[i] = "";
@@ -142,19 +145,20 @@ const char *fdt_board(uintptr_t fdt, struct board *b)
 			depth++;
 			if (depth == 3 && streq(stack[1], "cpus") && has_prefix(name, "cpu@"))
 				b->ncpus++;
-			node_is_gic = 0;
-			node_nreg = 0;
-			node_stride = 0;
+			if (depth < 16) {
+				node_is_gic[depth] = 0;
+				node_nreg[depth] = 0;
+				node_stride[depth] = 0;
+			}
 			p = align4(skip_str(p));
 		} else if (tok == FDT_END_NODE) {
-			if (node_is_gic && node_nreg >= 4 && !b->gicd) {
-				b->gicd = node_reg[0];
-				b->gicr = node_reg[2];
-				b->gicr_size = node_reg[3];
-				b->gicr_stride = node_stride ? node_stride : 0x20000;
+			int d = depth < 16 ? depth : 15;
+			if (node_is_gic[d] && node_nreg[d] >= 4 && !b->gicd) {
+				b->gicd = node_reg[d][0];
+				b->gicr = node_reg[d][2];
+				b->gicr_size = node_reg[d][3];
+				b->gicr_stride = node_stride[d] ? node_stride[d] : 0x20000;
 			}
-			node_is_gic = 0;
-			node_nreg = 0;
 			if (--depth <= 0)
 				break;
 		} else if (tok == FDT_PROP) {
@@ -164,6 +168,12 @@ const char *fdt_board(uintptr_t fdt, struct board *b)
 			const char *name = depth >= 1 && depth <= 16 ? stack[depth - 1] : "";
 			const char *parent = depth >= 2 && depth <= 16 ? stack[depth - 2] : "";
 
+			if (streq(pn, "compatible") && has_prefix(name, "interrupt-controller@")) {
+				if (!b->ic_compat[0])
+					b->ic_compat[0] = (const char *)val;
+				else if (!b->ic_compat[1])
+					b->ic_compat[1] = (const char *)val;
+			}
 			if (depth == 2 && streq(name, "psci") && streq(pn, "method")) {
 				b->psci_hvc = contains((const char *)val, len, "hvc");
 			} else if (depth == 2 && has_prefix(name, "memory") && streq(pn, "reg")) {
@@ -177,13 +187,22 @@ const char *fdt_board(uintptr_t fdt, struct board *b)
 				   len >= 16 && !b->splash_pa) {
 				b->splash_pa = be64(val);
 				b->splash_size = be64(val + 8);
-			} else if (streq(pn, "compatible") && contains((const char *)val, len, "arm,gic-v3")) {
-				node_is_gic = 1;
-			} else if (streq(pn, "reg") && has_prefix(name, "interrupt-controller@")) {
-				for (uint32_t o = 0; o + 8 <= len && node_nreg < 4; o += 8)
-					node_reg[node_nreg++] = be64(val + o);
-			} else if (streq(pn, "redistributor-stride") && has_prefix(name, "interrupt-controller@")) {
-				node_stride = len == 8 ? be64(val) : be32(val);
+			} else if (depth < 16 && ((streq(pn, "compatible") &&
+				   contains((const char *)val, len, "gic-v3")) ||
+				   streq(pn, "#redistributor-regions"))) {
+				/* vendor DTBs may not say "arm,gic-v3"; only a GICv3 has redistributors */
+				node_is_gic[depth] = 1;
+			} else if (depth < 16 && streq(pn, "reg") && has_prefix(name, "interrupt-controller@")) {
+				/*
+				 * The vendor /soc uses #address-cells = #size-cells = 1 (16 bytes
+				 * for GICD + GICR), mainline uses 2 (32 bytes).
+				 */
+				uint32_t cell = len == 16 ? 4 : 8;
+				for (uint32_t o = 0; o + cell <= len && node_nreg[depth] < 4; o += cell)
+					node_reg[depth][node_nreg[depth]++] = cell == 4 ? be32(val + o) : be64(val + o);
+			} else if (depth < 16 && streq(pn, "redistributor-stride") &&
+				   has_prefix(name, "interrupt-controller@")) {
+				node_stride[depth] = len == 8 ? be64(val) : be32(val);
 			}
 			p = align4(val + len);
 		} else if (tok != FDT_NOP) {

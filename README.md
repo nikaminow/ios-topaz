@@ -1,8 +1,8 @@
-# ios-topaz → Nothing Phone (3a) (`asteroids` branch)
+# ios-topaz â†’ Nothing Phone (3a) (`asteroids` branch)
 
 > **This branch ports ios-topaz to the Nothing Phone (3a)** (A059, codename `asteroids`,
 > Qualcomm SM7635 "milos" / Snapdragon 7s Gen 3).
-> **Status: experimental, the kernel has not booted on the phone yet.**
+> **Status: experimental. The XNU kernel boots on the phone (2026-10-27) and waits for the root device.**
 > Everything boots from RAM with `fastboot boot`: nothing is flashed and `userdata` is never
 > touched. A normal reboot brings Android back.
 
@@ -13,13 +13,14 @@
 | Hardware survey from a read-only RAM-booted probe | done: CPUs, memory map, GIC, PSCI, framebuffer |
 | Apple Device Tree for the phone (`tools/mkadt.py --asteroids`) | done |
 | Boot shim for the phone (`shim-asteroids/`) | done, builds with LLVM on Windows |
-| XNU patches 0951–0954 (below) | done, building on CI |
-| First kernel boot to the "no root device" panic | next |
-| Root file system in RAM (`rd=md0`), display, touch, Wi-Fi | later |
+| XNU patches 0951â€“0954 (below) | done, building on CI |
+| First kernel boot: platform expert, CPU0 + GIC (SGI OK), BSD, AMFI, Sandbox, HFS, then `Waiting on ... IOMedia Apple_HFS` | **done** |
+| Root file system in RAM (`rd=md0`, issue #5) | next |
+| Display, touch, Wi-Fi, more CPUs | later |
 
-**Why this phone fits well:** all eight cores (4× Cortex-A520 + 4× Cortex-A720) have the
-16K translation granule and LSE atomics, so the topaz Silver→Gold hand-off and the userland
-atomics emulation are not needed. The CPU numbering (MPIDR Aff1 = core, `0x000`–`0x700`) is
+**Why this phone fits well:** all eight cores (4Ã— Cortex-A520 + 4Ã— Cortex-A720) have the
+16K translation granule and LSE atomics, so the topaz Silverâ†’Gold hand-off and the userland
+atomics emulation are not needed. The CPU numbering (MPIDR Aff1 = core, `0x000`â€“`0x700`) is
 the same as the original ios-sweet target.
 
 **Hardware facts (from the ABL device tree):**
@@ -28,14 +29,14 @@ the same as the original ios-sweet target.
   firmware carve-out, Gunyah included, is below 4 GiB).
 - GIC-600 (GICv4): GICD `0x17100000`, GICR `0x17180000`, redistributor stride `0x40000`.
 - Arch timer: virtual = PPI 11 (INTID 27), 19.2 MHz. PSCI 1.1 over SMC. Linux runs at EL1 under Gunyah.
-- Framebuffer: ABL `splash_region` `0xe3940000`, 1080×2392, a8r8g8b8.
+- Framebuffer: ABL `splash_region` `0xe3940000`, 1080Ã—2392, a8r8g8b8.
 - UFS host `0x1d84000` (not used: no storage access at all on this branch).
 
 **New XNU patches:**
 
 | # | What |
 | --- | --- |
-| 0951 | CPU topology accepts the DynamIQ layout (`0x000`–`0x700`, boot core `0`) next to topaz's |
+| 0951 | CPU topology accepts the DynamIQ layout (`0x000`â€“`0x700`, boot core `0`) next to topaz's |
 | 0952 | GIC redistributor stride from the ADT (`redistributor-stride`), for GICv4's `0x40000` |
 | 0953 | The fixed-address early console only runs when the topaz shim booted the kernel; on this phone that RAM is the Wi-Fi firmware carve-out |
 | 0954 | SweetBattery's cpufreq and I2C register access only on a `xiaomi,topaz` ADT |
@@ -70,22 +71,22 @@ As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cort
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi ABL → `fastboot boot` of our shim (boot image v4) → XNU. Boot slots and other OSes on the phone are not touched |
-| CPU | The four Cortex-A73 ("Gold", MPIDR `0x100`–`0x103`) cores, 16K pages, GICv3, timers. The Silver cores are parked (see below) |
+| Boot | Stock Xiaomi ABL â†’ `fastboot boot` of our shim (boot image v4) â†’ XNU. Boot slots and other OSes on the phone are not touched |
+| CPU | The four Cortex-A73 ("Gold", MPIDR `0x100`â€“`0x103`) cores, 16K pages, GICv3, timers. The Silver cores are parked (see below) |
 | Memory | The upper DDR bank, `0x1_40000000` + 4 GiB |
 | Storage | UFS host driver (UFS 3.0 at `0x4804000`); the iOS root is a journaled HFS+ volume in `userdata`, read/write |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface (`SweetSurface`) + IOMobileFramebuffer (`AppleCLCD`); the MDP scans iOS surfaces directly from contiguous RAM below 4 GiB, double-buffered, with real cache maintenance (the Apple SoC config made it a no-op). Presented to iOS as an iPhone X panel (1125×2436 canvas centred on the 1080×2400 panel) |
+| Display | Kernel IOSurface (`SweetSurface`) + IOMobileFramebuffer (`AppleCLCD`); the MDP scans iOS surfaces directly from contiguous RAM below 4 GiB, double-buffered, with real cache maintenance (the Apple SoC config made it a no-op). Presented to iOS as an iPhone X panel (1125Ã—2436 canvas centred on the 1080Ã—2400 panel) |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings and other apps |
 | Touch and keys | FocalTech FT5452 touch on QUP0 SE2 (patch 0087 fixed the clock that hung the phone), power and volume keys |
-| Wi-Fi | `TopazModem` (patches 0113–0130): modem PAS boot through TrustZone from `modem_a`, GLINK/QRTR, pd-mapper/tftp/rmtfs, WLFW, copy engines, HTC/WMI/HTT, scan, association, WPA2-PSK 4-way handshake in the kernel, Ethernet data path. iOS sees it through `wifid` |
+| Wi-Fi | `TopazModem` (patches 0113â€“0130): modem PAS boot through TrustZone from `modem_a`, GLINK/QRTR, pd-mapper/tftp/rmtfs, WLFW, copy engines, HTC/WMI/HTT, scan, association, WPA2-PSK 4-way handshake in the kernel, Ethernet data path. iOS sees it through `wifid` |
 | Battery | Gauge and charger state (patch 0091) |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
 ## What does not work (yet)
 
 - **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP.** `bluetoothd` and `fairplayd.H2` relaunch constantly because the hardware is missing.
-- **Frame rate**: 25–35 frames a second in animations (the GPU and CoreAnimation's own pacing are the limits now), not yet 60.
+- **Frame rate**: 25â€“35 frames a second in animations (the GPU and CoreAnimation's own pacing are the limits now), not yet 60.
 - **Wi-Fi**: WPA2-PSK only (no WPA3, open networks untested), no power save, no MAC randomisation.
 - **Wallpaper and widgets**: LaunchServices registers apps but no app extensions on this root, so PosterBoard finds no wallpaper provider (being investigated).
 - **No real-time clock**: the date starts at 31 December.
@@ -181,7 +182,7 @@ fastboot -S 512M flash userdata ios16-root.simg   # ~5 minutes; do not unplug
 fastboot boot shim/out/shim-boot.img
 ```
 
-The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gold=…` for 8 seconds, then XNU starts. The first boot spends a while on the Apple logo (SpringBoard waits for LaunchServices to build its database); the lock screen follows after about 3 minutes. To get back to fastboot, hold Power + Volume down.
+The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=â€¦ gold=â€¦` for 8 seconds, then XNU starts. The first boot spends a while on the Apple logo (SpringBoard waits for LaunchServices to build its database); the lock screen follows after about 3 minutes. To get back to fastboot, hold Power + Volume down.
 
 ### Debugging tips
 
@@ -190,9 +191,9 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 
 ## Roadmap
 
-1. ~~Touch~~ and ~~buttons~~: done (patches 0083–0090).
-2. ~~Wi-Fi~~: done (patches 0113–0130); next: WPA3, open networks, power save.
-3. **GPU (Adreno 610)**, in progress: a kernel driver after topaz-woa `TopazGpuW` with Mesa freedreno behind CoreAnimation's OpenGL ES renderer. On the phone the lock screen, home screen and Settings already draw on the GPU. That work uses code from **HackiOS** (a port of iOS 16 to the POCO X5 Pro), published 2026-10-22 under APSL 2.0 / MIT: kernel patches 0900–0947, user space in `userland/` (eagl, Mesa patches, RedwoodAudio), see [CREDITS.md](CREDITS.md). Build the kernel on a Mac with `tools/build-local.sh`. The kernel IOSurface work it needed is here: patches 0131–0139 (`SweetSurface` values, bulk attachments, client-memory surfaces, the release protocol) and 0138 (empty `IOAcceleratorES`, which saves 30 s at every backboardd start). Next: render straight into display surfaces (today the CPU copies every frame out), GPU clock above 600 MHz with the GX voltage vote, then Metal.
+1. ~~Touch~~ and ~~buttons~~: done (patches 0083â€“0090).
+2. ~~Wi-Fi~~: done (patches 0113â€“0130); next: WPA3, open networks, power save.
+3. **GPU (Adreno 610)**, in progress: a kernel driver after topaz-woa `TopazGpuW` with Mesa freedreno behind CoreAnimation's OpenGL ES renderer. On the phone the lock screen, home screen and Settings already draw on the GPU. That work uses code from **HackiOS** (a port of iOS 16 to the POCO X5 Pro), published 2026-10-22 under APSL 2.0 / MIT: kernel patches 0900â€“0947, user space in `userland/` (eagl, Mesa patches, RedwoodAudio), see [CREDITS.md](CREDITS.md). Build the kernel on a Mac with `tools/build-local.sh`. The kernel IOSurface work it needed is here: patches 0131â€“0139 (`SweetSurface` values, bulk attachments, client-memory surfaces, the release protocol) and 0138 (empty `IOAcceleratorES`, which saves 30 s at every backboardd start). Next: render straight into display surfaces (today the CPU copies every frame out), GPU clock above 600 MHz with the GX voltage vote, then Metal.
 4. **Narrow the GIC fix** to the register that actually matters, then move it into XNU.
 5. **Real-time clock** from the PMIC RTC or passed in by the shim.
 6. **All 8 cores (experiment, later):** build XNU with 4K pages (drop `__ARM_16K_PG__` from `SWEET.h`, as XNU's own `BCM2837` Raspberry Pi 3 config does on Cortex-A53) and describe two clusters, Gold as `P` and Silver as `E`, so the AMP scheduler uses both. Risk: the iOS 16 userland was only ever run on 16K pages (hard-coded 16K in malloc, JIT guard pages, IOSurface, commpage layout), and the 16K assumptions in the shim and sweet's patches have to be checked too. The 16K Gold-only kernel stays as the fallback.
@@ -206,7 +207,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm), boot image v4, Gold hand-off, GIC setup, payload loader |
-| `xnu/patches/` | XNU patch series (applied in order by CI): sweet's 0001–0079, topaz's 0080+ |
+| `xnu/patches/` | XNU patch series (applied in order by CI): sweet's 0001â€“0079, topaz's 0080+ |
 | `.github/workflows/xnu.yml` | Kernel CI build |
 | `tools/mkadt.py` | Apple Device Tree for topaz (Gold cores, memory map, MMIO) and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
@@ -224,24 +225,24 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0081 | ARMv8.0: `-mcpu=cortex-a53`, no PAN, PFZ without CASA, userland LSE/LDAPR emulation |
 | 0082 | Boot CPU is Gold MPIDR `0x100` |
 | 0083 | Touch: FocalTech FT5452 on QUP0 SE2 (values from [topaz-woa](https://github.com/MakrSas/topaz-woa) TopazTouch) |
-| 0084–0090 | Touch diagnostics and fixes (0087: SE2 clock RCG was wrong and hung the phone; keys), LUN0 GPT watchdog (0088) |
+| 0084â€“0090 | Touch diagnostics and fixes (0087: SE2 clock RCG was wrong and hung the phone; keys), LUN0 GPT watchdog (0088) |
 | 0091 | Battery gauge and charger |
-| 0092–0103 | Direct MDP scanout of iOS surfaces from contiguous RAM, write-combined console, double-buffered frames, real dcache maintenance |
-| 0104–0107, 0110 | Panel brightness over DSI DCS, `AppleARMBacklight` for CoreBrightness (opt-in `sweetbl=1`), display on/off |
-| 0111–0112, 0119–0120 | Real dcache ops, console filter `sweetlog=WORDS`, `sweetfb_console=1` |
-| 0113–0130 | `TopazModem`: modem boot, GLINK/QRTR, modem host services, WLFW, WLAN scan, HTT, station, WPA2 join |
-| 0114 | iPhone X canvas (1125×2436) with a 16-byte aligned panel window |
-| 0127–0128 | `sweetbusy=N`; no IOKit-daemon busy hold (IOKit never quiesced, wifid hung boot) |
-| 0131–0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
+| 0092â€“0103 | Direct MDP scanout of iOS surfaces from contiguous RAM, write-combined console, double-buffered frames, real dcache maintenance |
+| 0104â€“0107, 0110 | Panel brightness over DSI DCS, `AppleARMBacklight` for CoreBrightness (opt-in `sweetbl=1`), display on/off |
+| 0111â€“0112, 0119â€“0120 | Real dcache ops, console filter `sweetlog=WORDS`, `sweetfb_console=1` |
+| 0113â€“0130 | `TopazModem`: modem boot, GLINK/QRTR, modem host services, WLFW, WLAN scan, HTT, station, WPA2 join |
+| 0114 | iPhone X canvas (1125Ã—2436) with a 16-byte aligned panel window |
+| 0127â€“0128 | `sweetbusy=N`; no IOKit-daemon busy hold (IOKit never quiesced, wifid hung boot) |
+| 0131â€“0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
 | 0138 | Empty `IOAcceleratorES` service |
 
 ## Key hardware facts (topaz)
 
-- SoC SM6225 "khaje": 4× Kryo 260 Silver (A53 class, MPIDR `0x0`–`0x3`) + 4× Kryo 260 Gold (A73 class, `0x100`–`0x103`). Only Gold has the 16K granule.
+- SoC SM6225 "khaje": 4Ã— Kryo 260 Silver (A53 class, MPIDR `0x0`â€“`0x3`) + 4Ã— Kryo 260 Gold (A73 class, `0x100`â€“`0x103`). Only Gold has the 16K granule.
 - DDR banks `0x40000000`+`0x3bb00000`, `0x80000000`+3 GiB, `0x1_40000000`+4 GiB; all fixed carve-outs are below `0x63900000`.
 - GICv3 at `0xf200000` (redistributors `0xf300000`, stride `0x20000`), virtual timer INTID 19, 19.2 MHz.
-- Panel: 1080×2400 DSI video mode with DSC, continuous splash at `0x5c000000`.
-- Touch: FocalTech FT5452 at `0x38` on QUP0 SE2, raw range 1350×3000 (1.25× the panel).
+- Panel: 1080Ã—2400 DSI video mode with DSC, continuous splash at `0x5c000000`.
+- Touch: FocalTech FT5452 at `0x38` on QUP0 SE2, raw range 1350Ã—3000 (1.25Ã— the panel).
 - More hardware notes for this phone: [MakrSas/topaz-woa](https://github.com/MakrSas/topaz-woa) (`docs/AGENT_BRIEF_drivers.md`).
 
 ## Credits
