@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b1e2896..f9f3877 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -70,11 +70,12 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	/* First sample soon (15 s) and often (every 15 s): a stall shows up fast. */
++	(void)tsleep(&chan, PZERO, "sweetsmp", 15 * hz);
++	for (int i = 0; i < 80; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 15 * hz);
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 262a39d..f987b4d 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1018,7 +1018,17 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		int n;
+ 		uint64_t fp;
+ 
++		/*
++		 * A thread blocked in the kernel (e.g. a lock or an event that never
++		 * comes) is where these ports hang; print its scheduler state, wait
++		 * event and continuation so the stall is visible even with no user regs.
++		 */
++		printf("SMP %s k%d state 0x%x wait_event 0x%llx continuation 0x%llx block_hint %u\n",
++		    name, tn, thread->state, (uint64_t)thread->wait_event,
++		    (uint64_t)thread->continuation, (unsigned)thread->block_hint);
++
+ 		if (ss == NULL || !is_saved_state64(ss)) {
++			tn++;
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
