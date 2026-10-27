@@ -1,0 +1,457 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6baf3a8..a42a94d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -33,6 +33,13 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -238,6 +245,13 @@ static struct {
+ 	uint64_t    root_pa, root_size, root_off;
+ 	uint32_t    root_chunk;
+ 	volatile bool root_done;
++	/* asteroids USB disk (sweet_usbdisk_rootdev): blocks served by the PC */
++	bool        disk;
++	uint64_t    bnc_pa;         /* bounce buffer for disk transfers */
++	vm_offset_t bnc;
++	uint32_t    disk_want;      /* bytes asked of the current bulk OUT */
++	uint32_t    disk_got;
++	volatile bool disk_rx_done, disk_tx_done;
+ } ud;
+ 
+ /* bulk OUT chunk: below the TRB's 24-bit length limit, a multiple of 512 */
+@@ -456,14 +470,14 @@ ud_setup(void)
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1:
+-			if (ud.root_pa) {
++			if (ud.root_pa || ud.disk) {
+ 				memcpy(data, ud_root_dev_desc, sizeof(ud_root_dev_desc)); n = sizeof(ud_root_dev_desc);
+ 			} else {
+ 				memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc);
+ 			}
+ 			break;
+ 		case 2:
+-			if (ud.root_pa) {
++			if (ud.root_pa || ud.disk) {
+ 				memcpy(data, ud_root_cfg_desc, sizeof(ud_root_cfg_desc)); n = sizeof(ud_root_cfg_desc);
+ 			} else {
+ 				memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc);
+@@ -562,6 +576,9 @@ ud_root_done(void)
+ static void
+ ud_rx_arm(void)
+ {
++	if (ud.disk) {
++		return;         /* disk mode starts each bulk OUT itself (udk_xfer) */
++	}
+ 	if (ud.root_pa) {
+ 		ud_root_arm();
+ 		return;
+@@ -572,6 +589,14 @@ ud_rx_arm(void)
+ static void
+ ud_rx_done(void)
+ {
++	if (ud.disk) {
++		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++		ud_sync(UD_TRB_RX, 16);
++		ud.disk_got = ud.disk_want - (t[2] & 0xffffff);
++		ud.disk_rx_done = true;
++		thread_wakeup(&ud.disk_rx_done);
++		return;
++	}
+ 	if (ud.root_pa) {
+ 		ud_root_done();
+ 		return;
+@@ -780,6 +805,11 @@ ud_event(uint32_t ev)
+ 		ud_rx_done();
+ 		return;
+ 	}
++	if (ep == EP_TX && type == 1 && ud.disk) {
++		ud.disk_tx_done = true;
++		thread_wakeup(&ud.disk_tx_done);
++		return;
++	}
+ 	if (ep == EP_TX && type == 1) {
+ 		lck_mtx_lock(ud.lock);
+ 		ud.tx_busy = false;
+@@ -911,7 +941,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	if (!ud.root_pa) {
++	if (!ud.root_pa && !ud.disk) {
+ 		ud_if_create();
+ 	}
+ 
+@@ -1017,4 +1047,335 @@ sweet_usb_root_receive(uint64_t pa, uint64_t size)
+ 	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
+ 	return 0;
+ }
++
++/*
++ * asteroids USB root disk (rd=usbdisk0): the root image stays on the PC and
++ * tools/usb-disk-serve.py answers block requests, so the phone's RAM is left
++ * to iOS. Same vendor interface as the root mode (1209:0002, WinUSB).
++ *
++ *   phone -> PC (bulk IN 0x81):  struct udk_req, then the data of a write
++ *   PC -> phone (bulk OUT 0x01): the data of a read, then struct udk_status
++ *
++ * One request at a time (udk_lock); the event thread completes transfers.
++ */
++#define UDK_REQ_MAGIC   0x44545341u     /* "ASTD" */
++#define UDK_STS_MAGIC   0x53545341u     /* "ASTS" */
++#define UDK_HELLO       0
++#define UDK_READ        1
++#define UDK_WRITE       2
++#define UDK_SYNC        3
++#define UDK_BLOCK       4096u
++#define UDK_MAX         (1024u * 1024)  /* bytes per request */
++#define UDK_BNC_SIZE    (UDK_MAX + 0x1000)
++#define UDK_TIMEOUT_MS  30000
++
++struct udk_req {
++	uint32_t magic, op, seq, length;
++	uint64_t offset, reserved;
++};
++struct udk_status {
++	uint32_t magic, seq, status, reserved;
++	uint64_t size, reserved2;
++};
++_Static_assert(sizeof(struct udk_req) == 32 && sizeof(struct udk_status) == 32, "udk wire format");
++
++static LCK_GRP_DECLARE(udk_grp, "sweet_usbdisk");
++static LCK_MTX_DECLARE(udk_lock, &udk_grp);
++static uint32_t udk_seq;
++static uint64_t udk_size;
++static dev_t udk_bdev;
++
++/* Wait for *flag (set by the event thread), up to UDK_TIMEOUT_MS. */
++static int
++udk_wait(volatile bool *flag)
++{
++	uint64_t deadline, end;
++	clock_interval_to_deadline(UDK_TIMEOUT_MS, NSEC_PER_MSEC, &end);
++	while (!*flag) {
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++		clock_interval_to_deadline(5, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline((event_t)flag, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	return 0;
++}
++
++/* One bulk transfer of len bytes from/to the bounce buffer start. */
++static int
++udk_xfer(bool in, uint32_t len)
++{
++	unsigned ep = in ? EP_TX : EP_RX;
++	uint32_t trb = in ? UD_TRB_TX : UD_TRB_RX;
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	/* OUT: a multiple of 512 so a full-sized reply completes the TRB */
++	uint32_t room = in ? len : (len + 511) & ~511u;
++
++	flush_dcache64((addr64_t)ud.bnc_pa, room, TRUE);
++	if (in) {
++		ud.disk_tx_done = false;
++	} else {
++		ud.disk_want = room;
++		ud.disk_got = 0;
++		ud.disk_rx_done = false;
++	}
++	t[0] = (uint32_t)ud.bnc_pa;
++	t[1] = (uint32_t)(ud.bnc_pa >> 32);
++	t[2] = room;
++	t[3] = TRBCTL_NORMAL | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(trb, 16);
++	uint64_t tpa = ud.dma_pa + trb;
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0)) {
++		return EIO;
++	}
++	int error = udk_wait(in ? &ud.disk_tx_done : &ud.disk_rx_done);
++	if (error) {
++		printf("SWEET USB DISK: %s %u bytes timed out\n", in ? "IN" : "OUT", len);
++		return error;
++	}
++	if (!in) {
++		flush_dcache64((addr64_t)ud.bnc_pa, room, TRUE);  /* drop stale lines */
++		if (ud.disk_got < len) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/* One request; data is in/out of the bounce buffer. udk_lock held. */
++static int
++udk_request(uint32_t op, uint64_t offset, uint32_t length, uint64_t *size_out)
++{
++	struct udk_req *q = (struct udk_req *)ud.bnc;
++	uint32_t seq = ++udk_seq;
++	int error;
++
++	/* a write's data is staged behind the request header */
++	if (op == UDK_WRITE) {
++		memmove((char *)ud.bnc + sizeof(*q), (const char *)ud.bnc + 0x1000, length);
++	}
++	q->magic = UDK_REQ_MAGIC;
++	q->op = op;
++	q->seq = seq;
++	q->length = length;
++	q->offset = offset;
++	q->reserved = 0;
++	if ((error = udk_xfer(true, sizeof(*q) + (op == UDK_WRITE ? length : 0)))) {
++		return error;
++	}
++	if (op == UDK_READ) {
++		if ((error = udk_xfer(false, length))) {
++			return error;
++		}
++		/* move the data out of the way of the status */
++		memmove((char *)ud.bnc + 0x1000, (const char *)ud.bnc, length);
++	}
++	if ((error = udk_xfer(false, sizeof(struct udk_status)))) {
++		return error;
++	}
++	const struct udk_status *s = (const struct udk_status *)ud.bnc;
++	if (s->magic != UDK_STS_MAGIC || s->seq != seq) {
++		printf("SWEET USB DISK: bad status (magic 0x%x seq %u, want %u)\n", s->magic, s->seq, seq);
++		return EIO;
++	}
++	if (size_out) {
++		*size_out = s->size;
++	}
++	return s->status ? EIO : 0;
++}
++
++static int
++udk_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return udk_size ? 0 : ENXIO;
++}
++
++static int
++udk_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++udk_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * UDK_BLOCK;
++	uint32_t count = buf_count(bp);
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (off > udk_size || count > udk_size - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++	lck_mtx_lock(&udk_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint32_t want = MIN(count - done, UDK_MAX);
++		char *data = (char *)ud.bnc + 0x1000;
++		if (!rd) {
++			memcpy(data, vaddr + done, want);
++		}
++		error = udk_request(rd ? UDK_READ : UDK_WRITE, off + done, want, NULL);
++		if (error) {
++			break;
++		}
++		if (rd) {
++			memcpy(vaddr + done, data, want);
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&udk_lock);
++	buf_unmap(bp);
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++udk_ioctl(u_long cmd, caddr_t data)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = UDK_BLOCK;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		return *f == UDK_BLOCK ? 0 : EINVAL;
++	case DKIOCGETBLOCKCOUNT:
++		*o = udk_size / UDK_BLOCK;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 1;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		lck_mtx_lock(&udk_lock);
++		int error = udk_request(UDK_SYNC, 0, 0, NULL);
++		lck_mtx_unlock(&udk_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = UDK_MAX / UDK_BLOCK;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++udk_bioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	return udk_ioctl(cmd, data);
++}
++
++static int
++udk_psize(__unused dev_t dev)
++{
++	return udk_size ? (int)MIN(udk_size / UDK_BLOCK, INT_MAX) : -1;
++}
++
++static int
++udk_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(udk_strategy, NULL, dev, B_READ, minphys, uio, UDK_BLOCK);
++}
++
++static int
++udk_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(udk_strategy, NULL, dev, B_WRITE, minphys, uio, UDK_BLOCK);
++}
++
++static const struct bdevsw udk_bdevsw = {
++	.d_open     = udk_open,
++	.d_close    = udk_close,
++	.d_strategy = udk_strategy,
++	.d_ioctl    = udk_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = udk_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw udk_cdevsw = {
++	.d_open       = udk_open,
++	.d_close      = udk_close,
++	.d_read       = udk_read,
++	.d_write      = udk_write,
++	.d_ioctl      = udk_bioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++int sweet_usbdisk_rootdev(dev_t *dev);
++
++/* rd=usbdisk0: bring the gadget up, wait for the PC's server, register the disk. */
++int
++sweet_usbdisk_rootdev(dev_t *dev)
++{
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0 || (usb_rd(dwc, 0xc120) >> 16) != 0x5533) {
++		printf("SWEET USB DISK: no DWC3 at 0x%x\n", DWC3_PA);
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &ud.bnc, UDK_BNC_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ud.bnc_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)ud.bnc));
++	ud.disk = true;
++	printf("SWEET USB DISK: waiting for the PC: run tools/usb-disk-serve.py\n");
++	sweet_usb_gadget_start(dwc);
++	while (!ud.configured) {
++		ud_sleep_ms(100);
++	}
++	lck_mtx_lock(&udk_lock);
++	int error = ETIMEDOUT;
++	for (int tries = 0; tries < 20 && error; tries++) {   /* the server may start late */
++		error = udk_request(UDK_HELLO, 0, 0, &udk_size);
++	}
++	lck_mtx_unlock(&udk_lock);
++	if (error || udk_size < UDK_BLOCK) {
++		printf("SWEET USB DISK: no answer from the PC (%d)\n", error);
++		return error ? error : ENXIO;
++	}
++	int bmajor = bdevsw_add(-1, &udk_bdevsw);
++	int cmajor = cdevsw_add_with_bdev(-1, &udk_cdevsw, bmajor);
++	if (bmajor < 0 || cmajor < 0) {
++		return ENXIO;
++	}
++	udk_bdev = makedev(bmajor, 0);
++	devfs_make_node(udk_bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "usbdisk0");
++	devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rusbdisk0");
++	printf("SWEET USB DISK: %llu MiB root disk from the PC\n", udk_size >> 20);
++	*dev = udk_bdev;
++	return 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index fa3ff4c..915e2e5 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -792,6 +792,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	asteroids: root disk served by the PC over USB (bsd/dev/sweet_usb.c, tools/usb-disk-serve.py)
++//
++	if (strcmp(rdBootVar, "usbdisk0") == 0) {
++		extern int sweet_usbdisk_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int usb_error = sweet_usbdisk_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: USB root disk unavailable: %d", usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
